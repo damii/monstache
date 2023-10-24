@@ -1488,11 +1488,11 @@ func filterDropInverseWithRegex(regex string) gtm.OpFilter {
 
 func (ic *indexClient) ensureClusterTTL() error {
 	io := options.Index()
-	io.SetName("expireAt")
+	io.SetName("_ts")
 	io.SetBackground(true)
 	io.SetExpireAfterSeconds(30)
 	im := mongo.IndexModel{
-		Keys:    bson.M{"expireAt": 1},
+		Keys:    bson.M{"_ts": 1},
 		Options: io,
 	}
 	col := ic.mongo.Database(ic.config.ConfigDatabaseName).Collection("cluster")
@@ -1520,7 +1520,7 @@ func (ic *indexClient) enableProcess() (bool, error) {
 	} else {
 		return false, err
 	}
-	doc["expireAt"] = time.Now().UTC()
+	doc["_ts"] = time.Now().UTC()
 	_, err = col.InsertOne(context.Background(), doc)
 	if err == nil {
 		// update using $currentDate
@@ -1559,7 +1559,7 @@ func (ic *indexClient) ensureEnabled() (enabled bool, err error) {
 						_, err = col.UpdateOne(context.Background(), bson.M{
 							"_id": ic.config.ResumeName,
 						}, bson.M{
-							"$currentDate": bson.M{"expireAt": true},
+							"$currentDate": bson.M{"_ts": true},
 						})
 					}
 				}
