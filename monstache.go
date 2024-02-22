@@ -26,6 +26,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"text/template"
 	"time"
@@ -86,7 +87,7 @@ var chunksRegex = regexp.MustCompile("\\.chunks$")
 var systemsRegex = regexp.MustCompile("system\\..+$")
 var exitStatus = 0
 
-const version = "6.7.14"
+const version = "6.7.17"
 const mongoURLDefault string = "mongodb://localhost:27017"
 const resumeNameDefault string = "default"
 const elasticMaxConnsDefault int = 4
@@ -166,6 +167,10 @@ type indexClient struct {
 	directReadsPending bool
 	externalShutdown   bool
 	rwmutex            sync.RWMutex
+	bulkErrs           atomic.Int64
+	bulkBackoff        elastic.Backoff
+	bulkBackoffC       chan time.Duration
+	bulkBackoffMax     time.Duration
 }
 
 type sigHandler struct {
@@ -297,11 +302,13 @@ type instanceStatus struct {
 	ResumeName   string              `json:"resumeName"`
 	LastTs       primitive.Timestamp `json:"lastTs"`
 	LastTsFormat string              `json:"lastTsFormat,omitempty"`
+	Backoff      bool                `json:"inBackoff,omitempty"`
 }
 
 type statusResponse struct {
 	enabled bool
 	lastTs  primitive.Timestamp
+	backoff bool
 }
 
 type statusRequest struct {
@@ -549,23 +556,77 @@ func (config *configOptions) ignoreCollectionForDirectReads(col string) bool {
 	return strings.HasPrefix(col, "system.")
 }
 
-func afterBulk(executionID int64, requests []elastic.BulkableRequest, response *elastic.BulkResponse, err error) {
-	if response == nil || !response.Errors {
-		return
+func (ic *indexClient) afterBulk() func(int64, []elastic.BulkableRequest, *elastic.BulkResponse, error) {
+	return func(executionID int64, requests []elastic.BulkableRequest, response *elastic.BulkResponse, err error) {
+		if response == nil || !response.Errors {
+			ic.bulkErrs.Store(0)
+			return
+		}
+		if failed := response.Failed(); failed != nil {
+			backoff := false
+			for _, item := range failed {
+				if item.Status == http.StatusConflict {
+					// ignore version conflict since this simply means the doc
+					// is already in the index
+					continue
+				}
+				logFailedResponseItem(item)
+				if item.Status == http.StatusNotFound {
+					// status not found should not initiate back off
+					continue
+				}
+				backoff = true
+			}
+			if backoff {
+				wait := ic.backoffDuration()
+				infoLog.Printf("Backing off for %.1f minutes after bulk indexing failures.", wait.Minutes())
+				// signal the event loop to pause pulling new events for a duration
+				ic.bulkBackoffC <- wait
+				// pause the bulk worker for a duration
+				ic.backoff(wait)
+				ic.bulkErrs.Add(1)
+			}
+		}
 	}
-	if failed := response.Failed(); failed != nil {
-		for _, item := range failed {
-			if item.Status == 409 {
-				// ignore version conflict since this simply means the doc
-				// is already in the index
-				continue
+}
+
+func logFailedResponseItem(item *elastic.BulkResponseItem) {
+	if encoded, err := json.Marshal(item); err == nil {
+		errorLog.Printf("Bulk response item: %s", string(encoded))
+	} else {
+		errorLog.Printf("Unable to marshal bulk response item: %s", err)
+	}
+}
+
+func (ic *indexClient) backoffDuration() time.Duration {
+	consecutiveErrors := int(ic.bulkErrs.Load())
+	wait, ok := ic.bulkBackoff.Next(consecutiveErrors)
+	if !ok {
+		wait = ic.bulkBackoffMax
+	}
+	return wait
+}
+
+func (ic *indexClient) backoff(wait time.Duration) {
+	timer := time.NewTimer(wait)
+	defer timer.Stop()
+	sigs := make(chan os.Signal, 1)
+	signal.Notify(sigs, syscall.SIGINT, syscall.SIGTERM)
+	defer signal.Stop(sigs)
+	for {
+		select {
+		case <-timer.C:
+			return
+		case <-sigs:
+			return
+		case req := <-ic.statusReqC:
+			enabled, lastTs := ic.enabled, ic.lastTs
+			statusResp := &statusResponse{
+				enabled: enabled,
+				lastTs:  lastTs,
+				backoff: true,
 			}
-			json, err := json.Marshal(item)
-			if err != nil {
-				errorLog.Printf("Unable to marshal bulk response item: %s", err)
-			} else {
-				errorLog.Printf("Bulk response item: %s", string(json))
-			}
+			req.responseC <- statusResp
 		}
 	}
 }
@@ -593,7 +654,8 @@ func (config *configOptions) parseElasticsearchVersion(number string) (err error
 	return
 }
 
-func (config *configOptions) newBulkProcessor(client *elastic.Client) (bulk *elastic.BulkProcessor, err error) {
+func (ic *indexClient) newBulkProcessor(client *elastic.Client) (bulk *elastic.BulkProcessor, err error) {
+	config := ic.config
 	bulkService := client.BulkProcessor().Name("monstache")
 	bulkService.Workers(config.ElasticMaxConns)
 	bulkService.Stats(config.Stats)
@@ -602,18 +664,18 @@ func (config *configOptions) newBulkProcessor(client *elastic.Client) (bulk *ela
 	if config.ElasticRetry == false {
 		bulkService.Backoff(&elastic.StopBackoff{})
 	}
-	bulkService.After(afterBulk)
+	bulkService.After(ic.afterBulk())
 	bulkService.FlushInterval(time.Duration(config.ElasticMaxSeconds) * time.Second)
 	return bulkService.Do(context.Background())
 }
 
-func (config *configOptions) newStatsBulkProcessor(client *elastic.Client) (bulk *elastic.BulkProcessor, err error) {
+func (ic *indexClient) newStatsBulkProcessor(client *elastic.Client) (bulk *elastic.BulkProcessor, err error) {
 	bulkService := client.BulkProcessor().Name("monstache-stats")
 	bulkService.Workers(1)
 	bulkService.Stats(false)
 	bulkService.BulkActions(-1)
 	bulkService.BulkSize(-1)
-	bulkService.After(afterBulk)
+	bulkService.After(ic.afterBulk())
 	bulkService.FlushInterval(time.Duration(5) * time.Second)
 	return bulkService.Do(context.Background())
 }
@@ -778,7 +840,7 @@ func opIDToString(op *gtm.Op) string {
 }
 
 func convertSliceJavascript(a []interface{}) []interface{} {
-	var avs []interface{}
+	avs := make([]interface{}, 0, len(a))
 	for _, av := range a {
 		var avc interface{}
 		switch achild := av.(type) {
@@ -797,7 +859,7 @@ func convertSliceJavascript(a []interface{}) []interface{} {
 }
 
 func convertMapJavascript(e map[string]interface{}) map[string]interface{} {
-	o := make(map[string]interface{})
+	o := make(map[string]interface{}, len(e))
 	for k, v := range e {
 		switch child := v.(type) {
 		case map[string]interface{}:
@@ -814,7 +876,7 @@ func convertMapJavascript(e map[string]interface{}) map[string]interface{} {
 }
 
 func fixSlicePruneInvalidJSON(id string, key string, a []interface{}) []interface{} {
-	var avs []interface{}
+	avs := make([]interface{}, 0, len(a))
 	for _, av := range a {
 		var avc interface{}
 		switch achild := av.(type) {
@@ -852,7 +914,7 @@ func fixSlicePruneInvalidJSON(id string, key string, a []interface{}) []interfac
 }
 
 func fixPruneInvalidJSON(id string, e map[string]interface{}) map[string]interface{} {
-	o := make(map[string]interface{})
+	o := make(map[string]interface{}, len(e))
 	for k, v := range e {
 		switch child := v.(type) {
 		case map[string]interface{}:
@@ -912,7 +974,7 @@ func deepExportValue(a interface{}) (b interface{}) {
 }
 
 func deepExportMapSlice(a []map[string]interface{}) []interface{} {
-	var avs []interface{}
+	avs := make([]interface{}, 0, len(a))
 	for _, av := range a {
 		avs = append(avs, deepExportMap(av))
 	}
@@ -920,7 +982,7 @@ func deepExportMapSlice(a []map[string]interface{}) []interface{} {
 }
 
 func deepExportSlice(a []interface{}) []interface{} {
-	var avs []interface{}
+	avs := make([]interface{}, 0, len(a))
 	for _, av := range a {
 		avs = append(avs, deepExportValue(av))
 	}
@@ -928,7 +990,7 @@ func deepExportSlice(a []interface{}) []interface{} {
 }
 
 func deepExportMap(e map[string]interface{}) map[string]interface{} {
-	o := make(map[string]interface{})
+	o := make(map[string]interface{}, len(e))
 	for k, v := range e {
 		o[k] = deepExportValue(v)
 	}
@@ -1342,11 +1404,11 @@ func parseIndexMeta(op *gtm.Op) (meta *indexingMeta) {
 
 func (ic *indexClient) addFileContent(op *gtm.Op) (err error) {
 	op.Data["file"] = ""
-	var gridByteBuffer bytes.Buffer
+	var fileContentBuilder strings.Builder
 	db, bucketName :=
 		ic.mongo.Database(op.GetDatabase()),
 		strings.SplitN(op.GetCollection(), ".", 2)[0]
-	encoder := base64.NewEncoder(base64.StdEncoding, &gridByteBuffer)
+	encoder := base64.NewEncoder(base64.StdEncoding, &fileContentBuilder)
 	opts := &options.BucketOptions{}
 	opts.SetName(bucketName)
 	var bucket *gridfs.Bucket
@@ -1366,7 +1428,7 @@ func (ic *indexClient) addFileContent(op *gtm.Op) (err error) {
 	if err = encoder.Close(); err != nil {
 		return
 	}
-	op.Data["file"] = string(gridByteBuffer.Bytes())
+	op.Data["file"] = fileContentBuilder.String()
 	return
 }
 
@@ -3807,9 +3869,9 @@ func (fc *findCall) restoreIds(v interface{}) (r interface{}) {
 			r = v
 		}
 	case []map[string]interface{}:
-		var avs []interface{}
+		avs := make([]interface{}, 0, len(vt))
 		for _, av := range vt {
-			mvs := make(map[string]interface{})
+			mvs := make(map[string]interface{}, len(av))
 			for k, v := range av {
 				mvs[k] = fc.restoreIds(v)
 			}
@@ -3817,13 +3879,13 @@ func (fc *findCall) restoreIds(v interface{}) (r interface{}) {
 		}
 		r = avs
 	case primitive.A:
-		var avs []interface{}
+		avs := make([]interface{}, 0, len(vt))
 		for _, av := range vt {
 			avs = append(avs, fc.restoreIds(av))
 		}
 		r = avs
 	case []interface{}:
-		var avs []interface{}
+		avs := make([]interface{}, 0, len(vt))
 		for _, av := range vt {
 			avs = append(avs, fc.restoreIds(av))
 		}
@@ -4185,6 +4247,7 @@ func (ctx *httpServerCtx) buildServer() {
 			if srsp != nil {
 				status.Enabled = srsp.enabled
 				status.LastTs = srsp.lastTs
+				status.Backoff = srsp.backoff
 				if srsp.lastTs.T != 0 {
 					status.LastTsFormat = time.Unix(int64(srsp.lastTs.T), 0).Format("2006-01-02T15:04:05")
 				}
@@ -4373,14 +4436,13 @@ func (ic *indexClient) setupFileIndexing() {
 }
 
 func (ic *indexClient) setupBulk() {
-	config := ic.config
-	bulk, err := config.newBulkProcessor(ic.client)
+	bulk, err := ic.newBulkProcessor(ic.client)
 	if err != nil {
 		errorLog.Fatalf("Unable to start bulk processor: %s", err)
 	}
 	var bulkStats *elastic.BulkProcessor
-	if config.IndexStats {
-		bulkStats, err = config.newStatsBulkProcessor(ic.client)
+	if ic.config.IndexStats {
+		bulkStats, err = ic.newStatsBulkProcessor(ic.client)
 		if err != nil {
 			errorLog.Fatalf("Unable to start stats bulk processor: %s", err)
 		}
@@ -4977,6 +5039,8 @@ func (ic *indexClient) eventLoop() {
 	ic.sigH.clientStartedC <- ic
 	for {
 		select {
+		case wait := <-ic.bulkBackoffC:
+			ic.backoff(wait)
 		case timeout := <-ic.doneC:
 			ic.enabled = false
 			ic.shutdown(timeout)
@@ -5179,7 +5243,6 @@ func (ic *indexClient) saveTimestampFromServerStatus() {
 	} else {
 		ic.processErr(err)
 	}
-	return
 }
 
 func (ic *indexClient) saveTimestampFromReplStatus() {
@@ -5297,24 +5360,27 @@ func main() {
 	elasticClient := buildElasticClient(config)
 
 	ic := &indexClient{
-		config:      config,
-		mongo:       mongoClient,
-		client:      elasticClient,
-		fileWg:      &sync.WaitGroup{},
-		indexWg:     &sync.WaitGroup{},
-		processWg:   &sync.WaitGroup{},
-		relateWg:    &sync.WaitGroup{},
-		opsConsumed: make(chan bool),
-		closeC:      make(chan bool),
-		doneC:       make(chan int),
-		enabled:     true,
-		indexC:      make(chan *gtm.Op),
-		processC:    make(chan *gtm.Op),
-		fileC:       make(chan *gtm.Op),
-		relateC:     make(chan *gtm.Op, config.RelateBuffer),
-		statusReqC:  make(chan *statusRequest),
-		sigH:        sh,
-		tokens:      bson.M{},
+		config:         config,
+		mongo:          mongoClient,
+		client:         elasticClient,
+		fileWg:         &sync.WaitGroup{},
+		indexWg:        &sync.WaitGroup{},
+		processWg:      &sync.WaitGroup{},
+		relateWg:       &sync.WaitGroup{},
+		opsConsumed:    make(chan bool),
+		closeC:         make(chan bool),
+		doneC:          make(chan int),
+		enabled:        true,
+		indexC:         make(chan *gtm.Op),
+		processC:       make(chan *gtm.Op),
+		fileC:          make(chan *gtm.Op),
+		relateC:        make(chan *gtm.Op, config.RelateBuffer),
+		statusReqC:     make(chan *statusRequest),
+		sigH:           sh,
+		tokens:         bson.M{},
+		bulkBackoffC:   make(chan time.Duration),
+		bulkBackoff:    elastic.NewExponentialBackoff(1*time.Minute, 1*time.Hour),
+		bulkBackoffMax: 1 * time.Hour,
 	}
 
 	ic.run()
